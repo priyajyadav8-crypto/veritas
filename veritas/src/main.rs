@@ -22,49 +22,75 @@ async fn main() -> Result<(), anyhow::Error> {
     program.attach("syscalls", "sys_enter_getdents64")?;
 
     println!("=== VERITAS - Kernel Truth Engine ===");
-    println!("The witness that cannot be bribed.\n");
+    println!("The witness that cannot be bribed.");
+    println!("--------------------------------------\n");
 
-    // Method 1: read /proc numeric dirs (standard ps view)
+    // --- METHOD 1: standard /proc readdir ---
     let proc_pids = get_proc_pids();
 
-    // Method 2: read /proc/sysvipc/msg and cross check thread count
-    let thread_count = get_thread_count();
+    // --- METHOD 2: brute force PID scan ---
+    let brute_pids = brute_force_pids(1, 65535);
 
-    // Method 3: check /proc/loadavg for running process count
-    let running = get_running_from_loadavg();
+    // --- METHOD 3: /proc/sched list ---
+    let sched_pids = get_sched_pids();
 
-    println!("[*] PIDs visible in /proc:        {}", proc_pids.len());
-    println!("[*] Total threads in /proc:       {}", thread_count);
-    println!("[*] Kernel running count:         {}", running);
+    println!("[*] Method 1 - /proc readdir:     {} PIDs", proc_pids.len());
+    println!("[*] Method 2 - brute force scan:  {} PIDs", brute_pids.len());
+    println!("[*] Method 3 - /proc/sched:       {} PIDs", sched_pids.len());
 
-    // Cross reference: check each PID has a valid status file
-    let ghost_pids = find_ghost_pids(&proc_pids);
+    // --- DIFF: brute force vs /proc ---
+    let hidden_from_proc: Vec<u32> = brute_pids
+        .difference(&proc_pids)
+        .copied()
+        .collect();
 
+    // --- DIFF: sched vs /proc ---
+    let hidden_from_sched: Vec<u32> = sched_pids
+        .difference(&proc_pids)
+        .copied()
+        .collect();
+
+    // --- RESULTS ---
     println!("\n--- PROCESS INTEGRITY CHECK ---");
-    if ghost_pids.is_empty() {
-        println!("[ok] All /proc PIDs have valid status files.");
+    if hidden_from_proc.is_empty() && hidden_from_sched.is_empty() {
+        println!("[ok] No hidden processes detected.");
+        println!("[ok] All methods agree on process count.");
     } else {
-        println!("[!] {} PID(s) missing status files - possible rootkit activity!", ghost_pids.len());
-        for pid in &ghost_pids {
-            println!("    [!] Ghost PID: {}", pid);
+        if !hidden_from_proc.is_empty() {
+            println!("[!] {} HIDDEN PROCESS(ES) DETECTED via brute force!", hidden_from_proc.len());
+            for pid in &hidden_from_proc {
+                let name = get_process_name(*pid).unwrap_or("unknown".to_string());
+                println!("    [!] PID {} - {} (visible to kernel, hidden from /proc)", pid, name);
+            }
+        }
+        if !hidden_from_sched.is_empty() {
+            println!("[!] {} HIDDEN PROCESS(ES) DETECTED via sched!", hidden_from_sched.len());
+            for pid in &hidden_from_sched {
+                let name = get_process_name(*pid).unwrap_or("unknown".to_string());
+                println!("    [!] PID {} - {} (in scheduler, hidden from /proc)", pid, name);
+            }
         }
     }
 
-    // Check ld.so.preload
+    // --- LD_PRELOAD CHECK ---
     println!("\n--- LD_PRELOAD INJECTION CHECK ---");
     check_ld_preload();
 
-    // Check for suspicious /proc entries
+    // --- NETWORK CHECK ---
+    println!("\n--- NETWORK SOCKET CHECK ---");
+    check_network();
+
+    // --- FILESYSTEM CHECK ---
     println!("\n--- FILESYSTEM INTEGRITY CHECK ---");
     check_proc_integrity();
 
-    println!("\n[*] eBPF probe active on getdents64 - press Ctrl-C to stop");
+    println!("\n[*] eBPF probe active - press Ctrl-C to stop");
     signal::ctrl_c().await?;
     println!("Exiting...");
     Ok(())
 }
 
-fn get_proc_pids() -> Vec<u32> {
+fn get_proc_pids() -> HashSet<u32> {
     fs::read_dir("/proc")
         .unwrap()
         .filter_map(|e| e.ok())
@@ -77,34 +103,47 @@ fn get_proc_pids() -> Vec<u32> {
         .collect()
 }
 
-fn get_thread_count() -> usize {
-    fs::read_dir("/proc")
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
-        .filter_map(|pid| {
-            fs::read_dir(format!("/proc/{}/task", pid)).ok()
+fn brute_force_pids(start: u32, end: u32) -> HashSet<u32> {
+    (start..=end)
+        .filter(|&pid| {
+            fs::metadata(format!("/proc/{}/status", pid)).is_ok()
         })
-        .flat_map(|d| d.filter_map(|e| e.ok()))
-        .count()
-}
-
-fn get_running_from_loadavg() -> String {
-    fs::read_to_string("/proc/loadavg")
-        .unwrap_or_default()
-        .split_whitespace()
-        .nth(3)
-        .unwrap_or("?")
-        .to_string()
-}
-
-fn find_ghost_pids(pids: &[u32]) -> Vec<u32> {
-    pids.iter()
-        .filter(|&&pid| {
-            fs::read_to_string(format!("/proc/{}/status", pid)).is_err()
-        })
-        .copied()
         .collect()
+}
+
+fn get_sched_pids() -> HashSet<u32> {
+    let mut pids = HashSet::new();
+    if let Ok(content) = fs::read_to_string("/proc/sched_debug") {
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 {
+                if let Ok(pid) = parts[3].trim_matches(',').parse::<u32>() {
+                    pids.insert(pid);
+                }
+            }
+        }
+    }
+    // fallback: use /proc/*/stat
+    if pids.is_empty() {
+        if let Ok(entries) = fs::read_dir("/proc") {
+            for entry in entries.filter_map(|e| e.ok()) {
+                if let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() {
+                    if let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid)) {
+                        if !stat.is_empty() {
+                            pids.insert(pid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pids
+}
+
+fn get_process_name(pid: u32) -> Option<String> {
+    fs::read_to_string(format!("/proc/{}/comm", pid))
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 fn check_ld_preload() {
@@ -119,25 +158,45 @@ fn check_ld_preload() {
     }
 }
 
-fn check_proc_integrity() {
-    let suspicious = vec![
-        "/proc/sched_debug",
-        "/proc/kallsyms",
-    ];
-
-    for path in suspicious {
-        match fs::metadata(path) {
-            Ok(_) => println!("[*] {} exists (normal on this kernel)", path),
-            Err(_) => println!("[!] {} missing - kernel may be modified", path),
+fn check_network() {
+    // Compare /proc/net/tcp entries vs ss output
+    match fs::read_to_string("/proc/net/tcp") {
+        Ok(content) => {
+            let count = content.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
+            println!("[*] /proc/net/tcp reports {} TCP connections", count);
         }
+        Err(_) => println!("[!] /proc/net/tcp unreadable - suspicious"),
     }
+    match fs::read_to_string("/proc/net/tcp6") {
+        Ok(content) => {
+            let count = content.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
+            println!("[*] /proc/net/tcp6 reports {} TCP6 connections", count);
+        }
+        Err(_) => println!("[!] /proc/net/tcp6 unreadable"),
+    }
+    match fs::read_to_string("/proc/net/udp") {
+        Ok(content) => {
+            let count = content.lines().skip(1).filter(|l| !l.trim().is_empty()).count();
+            println!("[*] /proc/net/udp reports {} UDP connections", count);
+        }
+        Err(_) => println!("[!] /proc/net/udp unreadable"),
+    }
+}
 
-    // Check if /proc/modules is readable
+fn check_proc_integrity() {
+    match fs::metadata("/proc/kallsyms") {
+        Ok(_) => println!("[ok] /proc/kallsyms exists"),
+        Err(_) => println!("[!] /proc/kallsyms missing - kernel may be modified"),
+    }
     match fs::read_to_string("/proc/modules") {
         Ok(content) => {
-            let module_count = content.lines().count();
-            println!("[ok] /proc/modules readable - {} modules loaded", module_count);
+            let count = content.lines().count();
+            println!("[ok] /proc/modules readable - {} modules loaded", count);
         }
         Err(_) => println!("[!] /proc/modules unreadable - suspicious"),
+    }
+    match fs::metadata("/proc/sched_debug") {
+        Ok(_) => println!("[ok] /proc/sched_debug exists"),
+        Err(_) => println!("[*] /proc/sched_debug missing (normal on WSL2)"),
     }
 }
