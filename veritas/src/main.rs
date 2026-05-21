@@ -400,22 +400,7 @@ fn get_socket_inodes_from_proc_net() -> std::collections::HashSet<u64> {
     inodes
 }
 
-fn check_hidden_files(dirs: &[&str]) -> Vec<String> {
-    let mut hidden = Vec::new();
-    for dir in dirs {
-        let Ok(entries) = fs::read_dir(dir) else { continue };
-        let userspace_files: std::collections::HashSet<String> = entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
 
-        // cross reference with direct stat calls on known critical files
-        // a rootkit hiding files will show fewer entries in readdir
-        // than direct stat reveals
-        let _ = userspace_files; // base collected
-    }
-    hidden
-}
 
 fn check_critical_paths() -> Vec<String> {
     let mut anomalies = Vec::new();
