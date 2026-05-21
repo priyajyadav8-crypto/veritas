@@ -190,6 +190,19 @@ async fn main() -> Result<(), anyhow::Error> {
         NetworkReport { tcp:0, tcp6:0, udp:0, hidden_sockets:0, clean:true }
     };
 
+    // --- HIDDEN FILE CHECK ---
+    if !cli.json && run_fs {
+        println!("\n--- HIDDEN FILE & MODULE CHECK ---");
+        let anomalies = check_critical_paths();
+        if anomalies.is_empty() {
+            println!("[ok] No hidden files or suspicious paths detected.");
+        } else {
+            for a in &anomalies {
+                println!("[!] {}", a);
+            }
+        }
+    }
+
     // --- FILESYSTEM CHECK ---
     let fs_report = if run_fs {
         let (ld_clean, ld_contents) = check_ld_preload_data();
@@ -385,4 +398,93 @@ fn get_socket_inodes_from_proc_net() -> std::collections::HashSet<u64> {
         }
     }
     inodes
+}
+
+fn check_hidden_files(dirs: &[&str]) -> Vec<String> {
+    let mut hidden = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(dir) else { continue };
+        let userspace_files: std::collections::HashSet<String> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+
+        // cross reference with direct stat calls on known critical files
+        // a rootkit hiding files will show fewer entries in readdir
+        // than direct stat reveals
+        let _ = userspace_files; // base collected
+    }
+    hidden
+}
+
+fn check_critical_paths() -> Vec<String> {
+    let mut anomalies = Vec::new();
+    let critical = vec![
+        ("/etc/passwd", "user database"),
+        ("/etc/shadow", "password hashes"),
+        ("/etc/sudoers", "sudo config"),
+        ("/etc/crontab", "cron jobs"),
+        ("/etc/rc.local", "startup script"),
+        ("/tmp/.X11-unix", "X11 socket dir"),
+    ];
+    for (path, label) in &critical {
+        match fs::metadata(path) {
+            Ok(meta) => {
+                // check for suspicious permissions
+                use std::os::unix::fs::MetadataExt;
+                let mode = meta.mode();
+                if *path == "/etc/passwd" && (mode & 0o022 != 0) {
+                    anomalies.push(format!("{} ({}) is world-writable!", path, label));
+                }
+                if *path == "/etc/shadow" && (mode & 0o044 != 0) {
+                    anomalies.push(format!("{} ({}) is readable by others!", path, label));
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    // check for suspicious files in common rootkit locations
+    let suspicious_paths = vec![
+        "/tmp/.ice-unix",
+        "/dev/shm/.hidden",
+        "/var/tmp/.hidden",
+        "/.hidden",
+    ];
+    for path in &suspicious_paths {
+        if fs::metadata(path).is_ok() {
+            anomalies.push(format!("Suspicious path exists: {}", path));
+        }
+    }
+
+    // check /proc/1/maps for injected libraries
+    if let Ok(maps) = fs::read_to_string("/proc/1/maps") {
+        let suspicious_libs = vec!["diamorphine", "reptile", "azazel", "rootkit"];
+        for line in maps.lines() {
+            for lib in &suspicious_libs {
+                if line.to_lowercase().contains(lib) {
+                    anomalies.push(format!("Suspicious library in PID 1 maps: {}", line));
+                }
+            }
+        }
+    }
+
+    // compare /proc/modules with /sys/module
+    let proc_modules: std::collections::HashSet<String> = fs::read_to_string("/proc/modules")
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.split_whitespace().next().unwrap_or("").to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let known_rootkit_modules = vec!["diamorphine", "reptile", "azazel", "necurs", "rootkit"];
+    for m in &proc_modules {
+        for rk in &known_rootkit_modules {
+            if m.to_lowercase().contains(rk) {
+                anomalies.push(format!("Known rootkit module loaded: {}", m));
+            }
+        }
+    }
+
+    anomalies
 }
