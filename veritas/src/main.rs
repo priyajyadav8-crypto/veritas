@@ -63,6 +63,8 @@ struct NetworkReport {
     tcp: usize,
     tcp6: usize,
     udp: usize,
+    hidden_sockets: usize,
+    clean: bool,
 }
 
 #[derive(Serialize)]
@@ -165,9 +167,27 @@ async fn main() -> Result<(), anyhow::Error> {
             println!();
         }
 
-        NetworkReport { tcp, tcp6, udp }
+        // hidden socket detection
+        let net1 = get_socket_inodes_from_proc_net();
+        let proc_inodes = get_network_socket_inodes_from_procs();
+        let net2 = get_socket_inodes_from_proc_net();
+        let net3 = get_socket_inodes_from_proc_net();
+        let stable: std::collections::HashSet<u64> = net1.iter().filter(|i| net2.contains(i) && net3.contains(i)).copied().collect();
+        let hidden_count = stable.difference(&proc_inodes).count();
+
+        if !cli.json {
+            if hidden_count == 0 {
+                println!("[ok] No hidden sockets detected.");
+            } else {
+                println!("[!] {} HIDDEN SOCKET(S) DETECTED!", hidden_count);
+                println!("[!] Sockets exist in kernel but are hidden from /proc/net");
+                println!("[*] Note: on WSL2 this may include legitimate system sockets");
+            }
+        }
+
+        NetworkReport { tcp, tcp6, udp, hidden_sockets: hidden_count, clean: hidden_count == 0 }
     } else {
-        NetworkReport { tcp:0, tcp6:0, udp:0 }
+        NetworkReport { tcp:0, tcp6:0, udp:0, hidden_sockets:0, clean:true }
     };
 
     // --- FILESYSTEM CHECK ---
@@ -221,6 +241,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // --- VERDICT ---
     let compromised = !process_report.clean
+        || !network_report.clean
         || !fs_report.ld_preload_clean
         || !fs_report.suspicious_modules.is_empty();
 
@@ -318,4 +339,57 @@ fn check_modules_data() -> (usize, Vec<String>) {
         .map(|l| l.to_string())
         .collect();
     (count, suspicious)
+}
+
+fn get_socket_inodes_from_procs() -> std::collections::HashSet<u64> {
+    // Only return inodes that appear in /proc/net/* (network sockets only)
+    // This excludes Unix domain sockets which are not network connections
+    get_socket_inodes_from_proc_net()
+        .union(&std::collections::HashSet::new())
+        .copied()
+        .collect()
+}
+
+fn get_network_socket_inodes_from_procs() -> std::collections::HashSet<u64> {
+    let net_inodes = get_socket_inodes_from_proc_net();
+    let mut found = std::collections::HashSet::new();
+    let Ok(proc_dir) = fs::read_dir("/proc") else { return found };
+    for entry in proc_dir.filter_map(|e| e.ok()) {
+        let Ok(_pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
+        let fd_path = format!("/proc/{}/fd", entry.file_name().to_string_lossy());
+        let Ok(fd_dir) = fs::read_dir(&fd_path) else { continue };
+        for fd in fd_dir.filter_map(|e| e.ok()) {
+            let fd_full = format!("{}/{}", fd_path, fd.file_name().to_string_lossy());
+            if let Ok(target) = fs::read_link(&fd_full) {
+                let t = target.to_string_lossy();
+                if t.starts_with("socket:[") {
+                    if let Some(inode_str) = t.strip_prefix("socket:[").and_then(|s| s.strip_suffix("]")) {
+                        if let Ok(inode) = inode_str.parse::<u64>() {
+                            // only include if it is a known network socket
+                            if net_inodes.contains(&inode) {
+                                found.insert(inode);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+fn get_socket_inodes_from_proc_net() -> std::collections::HashSet<u64> {
+    let mut inodes = std::collections::HashSet::new();
+    for path in &["/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp", "/proc/net/udp6"] {
+        let Ok(content) = fs::read_to_string(path) else { continue };
+        for line in content.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 10 {
+                if let Ok(inode) = fields[9].parse::<u64>() {
+                    inodes.insert(inode);
+                }
+            }
+        }
+    }
+    inodes
 }
