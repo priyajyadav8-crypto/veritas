@@ -1,0 +1,64 @@
+.TH VERITAS 1 "2026" "veritas 0.1.0" "Security Tools"
+.SH NAME
+veritas \- kernel truth engine for detecting hidden processes, files, and sockets
+.SH SYNOPSIS
+.B veritas
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+Veritas uses eBPF to observe the system from inside the Linux kernel and cross-references what the kernel sees against what userspace tools report. It detects rootkits and other malicious software that hide processes, network sockets, and files from standard userspace tools such as ps, netstat, and ls.
+.PP
+Veritas answers one question with integrity: Can I still trust what this machine is telling me?
+.SH OPTIONS
+.TP
+.B \-\-diff
+Run full kernel-vs-userspace diff. This is the default mode.
+.TP
+.B \-\-json
+Output results as JSON for pipeline and SIEM integration.
+.TP
+.B \-\-processes
+Check only the process table.
+.TP
+.B \-\-network
+Check only network sockets.
+.TP
+.B \-\-fs
+Check only filesystem integrity and LD_PRELOAD injection.
+.SH CHECKS PERFORMED
+.TP
+.B Process integrity
+Brute force PID scan vs /proc diff with thread filtering. Detects processes visible to the kernel but hidden from /proc.
+.TP
+.B Network sockets
+Cross-references socket inodes from process file descriptors against /proc/net/tcp, tcp6, and udp.
+.TP
+.B LD_PRELOAD injection
+Reads /etc/ld.so.preload and flags any non-empty contents.
+.TP
+.B Kernel modules
+Scans /proc/modules for known rootkit module names.
+.TP
+.B Critical paths
+Checks permissions on /etc/passwd, /etc/shadow, and other critical files.
+.SH REQUIREMENTS
+Root privileges or CAP_BPF capability. Linux kernel 5.15 or higher. x86_64 architecture.
+.SH EXAMPLES
+.TP
+Run full diff:
+.B sudo veritas --diff
+.TP
+JSON output for SIEM:
+.B sudo veritas --json | jq .verdict
+.TP
+Check processes only:
+.B sudo veritas --processes
+.SH PROOF OF CONCEPT
+Veritas has been tested against the Diamorphine kernel rootkit on Debian 13 kernel 6.12. Diamorphine successfully hid PID 9201 from ps and all userspace tools. Veritas detected it via eBPF kernel diff.
+.SH BUGS
+Report bugs at https://github.com/priyajyadav8-crypto/veritas/issues
+.SH AUTHOR
+priyajyadav8-crypto
+.SH SEE ALSO
+.BR ps (1),
+.BR netstat (8),
+.BR lsof (8)
