@@ -341,14 +341,7 @@ fn check_modules_data() -> (usize, Vec<String>) {
     (count, suspicious)
 }
 
-fn get_socket_inodes_from_procs() -> std::collections::HashSet<u64> {
-    // Only return inodes that appear in /proc/net/* (network sockets only)
-    // This excludes Unix domain sockets which are not network connections
-    get_socket_inodes_from_proc_net()
-        .union(&std::collections::HashSet::new())
-        .copied()
-        .collect()
-}
+
 
 fn get_network_socket_inodes_from_procs() -> std::collections::HashSet<u64> {
     let net_inodes = get_socket_inodes_from_proc_net();
